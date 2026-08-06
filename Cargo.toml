@@ -42,7 +42,10 @@ async-stream = "0.3"
 futures = "0.3"
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` makes float parsing exact. Without it serde_json's fast path
+# can land a ULP away, so an `Event`'s f64 timestamp does not survive a JSON
+# round trip — which the SQLite store relies on, since it holds events as JSON.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util", "process"] }
 tracing = "0.1"

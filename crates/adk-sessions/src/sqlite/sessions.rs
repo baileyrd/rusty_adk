@@ -1,168 +1,38 @@
-//! A durable [`SessionService`] backed by SQLite.
-//!
-//! [`InMemorySessionService`](crate::InMemorySessionService) loses everything
-//! at process exit, which makes it unusable for the two things ADK sessions
-//! exist to support: a conversation that spans restarts, and a
-//! human-in-the-loop run that suspends now and resumes tomorrow. This backend
-//! keeps the same semantics — the prefix routing, the hydration, the refusal to
-//! record partial events — and writes them to a file.
-//!
-//! # Storage layout
-//!
-//! | Table | Holds |
-//! |---|---|
-//! | `sessions` | one row per thread, with its last-update time |
-//! | `events` | the history, one row per event, ordered by `seq` |
-//! | `session_state` | unprefixed keys, scoped to one thread |
-//! | `user_state` | `user:` keys, shared across one user's threads |
-//! | `app_state` | `app:` keys, shared by every user of an app |
-//!
-//! `temp:` keys have no table: they are dropped on the way in, which is what
-//! makes them temporary.
-//!
-//! An event is stored as its serialized JSON rather than as columns per field.
-//! That is deliberate. ADK 2.0 added `node_info` and `output` to the event
-//! schema, and a column-per-field store would have needed a migration to carry
-//! them; a JSON payload round-trips new fields with no schema change at all.
-//!
-//! # Concurrency
-//!
-//! [`rusqlite`] is a blocking library, so every query runs on
-//! [`tokio::task::spawn_blocking`] with the connection lock taken *inside* the
-//! blocking closure — it is never held across an await point. The database is
-//! opened in WAL mode with a busy timeout so a second process reading the same
-//! file does not immediately fail.
-//!
-//! # Example
-//!
-//! ```
-//! # tokio_test::block_on(async {
-//! use adk_core::{Event, SessionService};
-//! use adk_sessions::SqliteSessionService;
-//!
-//! let service = SqliteSessionService::in_memory().await?;
-//! let mut session = service.create_session("app", "u1", None, None).await?;
-//!
-//! let mut event = Event::new("inv-1", "agent").with_text("hi");
-//! event.actions.set_state("user:login_count", 5);
-//! service.append_event(&mut session, event).await?;
-//!
-//! let reloaded = service
-//!     .get_session("app", "u1", &session.id)
-//!     .await?
-//!     .expect("the thread is on disk");
-//! assert_eq!(reloaded.events.len(), 1);
-//! assert_eq!(reloaded.state.get("user:login_count").unwrap(), 5);
-//! # Ok::<(), adk_core::AdkError>(())
-//! # }).unwrap();
-//! ```
+//! The SQLite-backed [`SessionService`].
 
 use adk_core::{AdkError, Event, Result, Session, SessionService, State, StateScope};
 use async_trait::async_trait;
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Statement, ToSql};
+use rusqlite::{params, Connection, OptionalExtension, Statement, ToSql};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-/// The schema this build knows how to read and write.
-///
-/// Recorded in SQLite's `user_version`, so a future release can migrate an
-/// older file rather than guess at its shape.
-const SCHEMA_VERSION: i64 = 1;
-
-/// How long to wait for a lock held by another connection before giving up.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS sessions (
-    app_name         TEXT NOT NULL,
-    user_id          TEXT NOT NULL,
-    id               TEXT NOT NULL,
-    create_time      REAL NOT NULL,
-    last_update_time REAL NOT NULL,
-    PRIMARY KEY (app_name, user_id, id)
-);
-
-CREATE TABLE IF NOT EXISTS events (
-    app_name   TEXT    NOT NULL,
-    user_id    TEXT    NOT NULL,
-    session_id TEXT    NOT NULL,
-    seq        INTEGER NOT NULL,
-    payload    TEXT    NOT NULL,
-    PRIMARY KEY (app_name, user_id, session_id, seq),
-    FOREIGN KEY (app_name, user_id, session_id)
-        REFERENCES sessions (app_name, user_id, id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS session_state (
-    app_name   TEXT NOT NULL,
-    user_id    TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    key        TEXT NOT NULL,
-    value      TEXT NOT NULL,
-    PRIMARY KEY (app_name, user_id, session_id, key),
-    FOREIGN KEY (app_name, user_id, session_id)
-        REFERENCES sessions (app_name, user_id, id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS user_state (
-    app_name TEXT NOT NULL,
-    user_id  TEXT NOT NULL,
-    key      TEXT NOT NULL,
-    value    TEXT NOT NULL,
-    PRIMARY KEY (app_name, user_id, key)
-);
-
-CREATE TABLE IF NOT EXISTS app_state (
-    app_name TEXT NOT NULL,
-    key      TEXT NOT NULL,
-    value    TEXT NOT NULL,
-    PRIMARY KEY (app_name, key)
-);
-"#;
-
-/// Turns a `rusqlite` failure into an [`AdkError`], preserving whether a retry
-/// could plausibly succeed.
-fn map_sql_error(err: rusqlite::Error) -> AdkError {
-    let transient = matches!(
-        err.sqlite_error_code(),
-        Some(ErrorCode::DatabaseBusy) | Some(ErrorCode::DatabaseLocked)
-    );
-    if transient {
-        AdkError::storage_retryable(err.to_string())
-    } else {
-        AdkError::storage(err.to_string())
-    }
-}
-
-/// Lets a `rusqlite` result join an ADK `?` chain.
-trait SqlExt<T> {
-    fn sql(self) -> Result<T>;
-}
-
-impl<T> SqlExt<T> for std::result::Result<T, rusqlite::Error> {
-    fn sql(self) -> Result<T> {
-        self.map_err(map_sql_error)
-    }
-}
+use super::{Db, SqlExt};
 
 /// A [`SessionService`] that stores threads, history, and scoped state in a
 /// SQLite database.
 ///
-/// See the [module documentation](self) for the storage layout and the
-/// concurrency model.
+/// Behaviourally identical to
+/// [`InMemorySessionService`](crate::InMemorySessionService): the same prefix
+/// routing, the same hydration of `app:` and `user:` values onto each thread,
+/// the same refusal to record partial events. See the
+/// [module documentation](super) for the storage layout and the concurrency
+/// model.
+///
+/// Build one with [`SqliteSessionService::open`], or take it from a
+/// [`SqliteStore`](super::SqliteStore) to share a database with the artifact
+/// service.
 #[derive(Debug, Clone)]
 pub struct SqliteSessionService {
-    conn: Arc<Mutex<Connection>>,
+    db: Db,
 }
 
 impl SqliteSessionService {
     /// Opens (or creates) a database file and applies the schema.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        Self::build(move || Connection::open(path)).await
+        Ok(Self {
+            db: Db::open(path).await?,
+        })
     }
 
     /// Opens a private in-memory database.
@@ -172,7 +42,9 @@ impl SqliteSessionService {
     /// here are readable back. Useful in tests that want the SQLite code path
     /// without touching the filesystem.
     pub async fn in_memory() -> Result<Self> {
-        Self::build(Connection::open_in_memory).await
+        Ok(Self {
+            db: Db::in_memory().await?,
+        })
     }
 
     /// Wraps an already-open connection, applying pragmas and the schema.
@@ -180,84 +52,14 @@ impl SqliteSessionService {
     /// Use this to hand in a connection configured elsewhere — an encrypted
     /// database, a custom VFS, a shared cache.
     pub fn from_connection(conn: Connection) -> Result<Self> {
-        prepare(&conn)?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            db: Db::adopt(conn)?,
         })
     }
 
-    async fn build<F>(open: F) -> Result<Self>
-    where
-        F: FnOnce() -> std::result::Result<Connection, rusqlite::Error> + Send + 'static,
-    {
-        blocking(move || {
-            let conn = open().sql()?;
-            prepare(&conn)?;
-            Ok(conn)
-        })
-        .await
-        .map(|conn| Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+    pub(super) fn from_db(db: Db) -> Self {
+        Self { db }
     }
-
-    /// Runs a database operation on the blocking pool.
-    ///
-    /// The lock is acquired inside the closure, so it is never held across an
-    /// await point.
-    async fn with_conn<F, T>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let conn = Arc::clone(&self.conn);
-        blocking(move || {
-            let mut guard = conn.lock().unwrap_or_else(|e| e.into_inner());
-            f(&mut guard)
-        })
-        .await
-    }
-}
-
-/// Runs a blocking database closure on tokio's blocking pool.
-async fn blocking<F, T>(f: F) -> Result<T>
-where
-    F: FnOnce() -> Result<T> + Send + 'static,
-    T: Send + 'static,
-{
-    match tokio::task::spawn_blocking(f).await {
-        Ok(result) => result,
-        Err(join) => Err(AdkError::storage(format!(
-            "sqlite worker did not finish: {join}"
-        ))),
-    }
-}
-
-/// Applies connection pragmas and brings the schema up to date.
-fn prepare(conn: &Connection) -> Result<()> {
-    conn.busy_timeout(BUSY_TIMEOUT).sql()?;
-    conn.pragma_update(None, "foreign_keys", true).sql()?;
-    // WAL lets a reader and a writer work at once. In-memory databases report
-    // "memory" instead and that is fine, so the answer is read but not checked.
-    let _: String = conn
-        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
-        .sql()?;
-
-    let version: i64 = conn
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .sql()?;
-    if version > SCHEMA_VERSION {
-        return Err(AdkError::storage(format!(
-            "session database is at schema version {version}, but this build \
-             understands at most {SCHEMA_VERSION}"
-        )));
-    }
-    if version < SCHEMA_VERSION {
-        conn.execute_batch(SCHEMA).sql()?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .sql()?;
-    }
-    Ok(())
 }
 
 /// Collects a `(key, value)` query's rows into `merged`, decoding the JSON.
@@ -423,34 +225,35 @@ impl SessionService for SqliteSessionService {
         let initial = state.map(|s| s.to_map()).unwrap_or_default();
         let (app_name, user_id) = (app_name.to_string(), user_id.to_string());
 
-        self.with_conn(move |conn| {
-            let tx = conn.transaction().sql()?;
-            let now = adk_core::now_seconds();
+        self.db
+            .with(move |conn| {
+                let tx = conn.transaction().sql()?;
+                let now = adk_core::now_seconds();
 
-            // Reusing an id starts the thread over, as the in-memory service
-            // does; the cascade clears whatever the old thread left behind.
-            tx.execute(
-                "DELETE FROM sessions WHERE app_name = ?1 AND user_id = ?2 AND id = ?3",
-                params![app_name, user_id, id],
-            )
-            .sql()?;
-            tx.execute(
-                "INSERT INTO sessions (app_name, user_id, id, create_time, last_update_time) \
+                // Reusing an id starts the thread over, as the in-memory service
+                // does; the cascade clears whatever the old thread left behind.
+                tx.execute(
+                    "DELETE FROM sessions WHERE app_name = ?1 AND user_id = ?2 AND id = ?3",
+                    params![app_name, user_id, id],
+                )
+                .sql()?;
+                tx.execute(
+                    "INSERT INTO sessions (app_name, user_id, id, create_time, last_update_time) \
                  VALUES (?1, ?2, ?3, ?4, ?4)",
-                params![app_name, user_id, id, now],
-            )
-            .sql()?;
+                    params![app_name, user_id, id, now],
+                )
+                .sql()?;
 
-            // Starting state may carry scoped keys; route them before storing.
-            write_state(&tx, &app_name, &user_id, &id, &initial)?;
+                // Starting state may carry scoped keys; route them before storing.
+                write_state(&tx, &app_name, &user_id, &id, &initial)?;
 
-            let mut session = Session::new(&id, &app_name, &user_id);
-            session.last_update_time = now;
-            session.state = State::from_map(read_state(&tx, &app_name, &user_id, &id)?);
-            tx.commit().sql()?;
-            Ok(session)
-        })
-        .await
+                let mut session = Session::new(&id, &app_name, &user_id);
+                session.last_update_time = now;
+                session.state = State::from_map(read_state(&tx, &app_name, &user_id, &id)?);
+                tx.commit().sql()?;
+                Ok(session)
+            })
+            .await
     }
 
     async fn get_session(
@@ -464,38 +267,40 @@ impl SessionService for SqliteSessionService {
             user_id.to_string(),
             session_id.to_string(),
         );
-        self.with_conn(move |conn| load_session(conn, &app_name, &user_id, &session_id, true))
+        self.db
+            .with(move |conn| load_session(conn, &app_name, &user_id, &session_id, true))
             .await
     }
 
     async fn list_sessions(&self, app_name: &str, user_id: &str) -> Result<Vec<Session>> {
         let (app_name, user_id) = (app_name.to_string(), user_id.to_string());
-        self.with_conn(move |conn| {
-            let ids: Vec<String> = {
-                let mut stmt = conn
+        self.db
+            .with(move |conn| {
+                let ids: Vec<String> = {
+                    let mut stmt = conn
                     .prepare_cached(
                         "SELECT id FROM sessions WHERE app_name = ?1 AND user_id = ?2 ORDER BY id",
                     )
                     .sql()?;
-                let mut rows = stmt.query(params![app_name, user_id]).sql()?;
-                let mut ids = Vec::new();
-                while let Some(row) = rows.next().sql()? {
-                    ids.push(row.get(0).sql()?);
-                }
-                ids
-            };
+                    let mut rows = stmt.query(params![app_name, user_id]).sql()?;
+                    let mut ids = Vec::new();
+                    while let Some(row) = rows.next().sql()? {
+                        ids.push(row.get(0).sql()?);
+                    }
+                    ids
+                };
 
-            // Listings omit history: callers use this to pick a thread, and
-            // materializing every event would be wasteful.
-            let mut sessions = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(session) = load_session(conn, &app_name, &user_id, &id, false)? {
-                    sessions.push(session);
+                // Listings omit history: callers use this to pick a thread, and
+                // materializing every event would be wasteful.
+                let mut sessions = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(session) = load_session(conn, &app_name, &user_id, &id, false)? {
+                        sessions.push(session);
+                    }
                 }
-            }
-            Ok(sessions)
-        })
-        .await
+                Ok(sessions)
+            })
+            .await
     }
 
     async fn delete_session(&self, app_name: &str, user_id: &str, session_id: &str) -> Result<()> {
@@ -504,19 +309,20 @@ impl SessionService for SqliteSessionService {
             user_id.to_string(),
             session_id.to_string(),
         );
-        self.with_conn(move |conn| {
-            let removed = conn
-                .execute(
-                    "DELETE FROM sessions WHERE app_name = ?1 AND user_id = ?2 AND id = ?3",
-                    params![app_name, user_id, session_id],
-                )
-                .sql()?;
-            if removed == 0 {
-                return Err(AdkError::SessionNotFound(session_id));
-            }
-            Ok(())
-        })
-        .await
+        self.db
+            .with(move |conn| {
+                let removed = conn
+                    .execute(
+                        "DELETE FROM sessions WHERE app_name = ?1 AND user_id = ?2 AND id = ?3",
+                        params![app_name, user_id, session_id],
+                    )
+                    .sql()?;
+                if removed == 0 {
+                    return Err(AdkError::SessionNotFound(session_id));
+                }
+                Ok(())
+            })
+            .await
     }
 
     async fn append_event(&self, session: &mut Session, event: Event) -> Result<()> {
@@ -536,7 +342,8 @@ impl SessionService for SqliteSessionService {
         let recorded = event.clone();
 
         let (events, state, last_update_time) = self
-            .with_conn(move |conn| {
+            .db
+            .with(move |conn| {
                 let tx = conn.transaction().sql()?;
 
                 let exists: Option<i64> = tx
@@ -890,12 +697,43 @@ mod tests {
         assert_eq!(stored.output.as_ref().unwrap()["plan"][1], json!("b"));
     }
 
+    /// Storing events as JSON is only safe if JSON is lossless for them. The
+    /// `timestamp` is the field that tests it: an `f64` needs exact float
+    /// parsing to come back bit-for-bit.
     #[tokio::test]
-    async fn a_newer_schema_version_is_refused() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+    async fn a_stored_event_comes_back_identical() {
+        let svc = service().await;
+        let mut session = svc.create_session("app", "u1", None, None).await.unwrap();
+
+        let mut event = Event::new("inv", "agent").with_text("hello");
+        event.actions.set_state("step", "greeted");
+        let original = event.clone();
+        svc.append_event(&mut session, event).await.unwrap();
+
+        let reloaded = svc
+            .get_session("app", "u1", &session.id)
+            .await
+            .unwrap()
             .unwrap();
-        let err = SqliteSessionService::from_connection(conn).unwrap_err();
-        assert!(matches!(err, AdkError::Storage { .. }), "{err}");
+        assert_eq!(reloaded.events[0], original);
+    }
+
+    #[tokio::test]
+    async fn a_reused_id_starts_the_thread_over() {
+        let svc = service().await;
+        let mut session = svc
+            .create_session("app", "u1", None, Some("s1".into()))
+            .await
+            .unwrap();
+        let mut event = Event::new("inv", "agent").with_text("x");
+        event.actions.set_state("step", "one");
+        svc.append_event(&mut session, event).await.unwrap();
+
+        let reborn = svc
+            .create_session("app", "u1", None, Some("s1".into()))
+            .await
+            .unwrap();
+        assert!(reborn.events.is_empty());
+        assert!(reborn.state.get("step").is_none());
     }
 }

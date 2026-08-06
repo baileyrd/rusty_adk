@@ -7,10 +7,12 @@
 //! - [`InMemorySessionService`], [`InMemoryArtifactService`], and
 //!   [`InMemoryMemoryService`] keep everything in process memory. They are the
 //!   right default for tests and for a single-run script.
-//! - `SqliteSessionService` (feature `sqlite`) writes threads, history, and
-//!   scoped state to a database file, so a conversation — or a suspended
-//!   human-in-the-loop run — survives a restart. It reproduces the in-memory
-//!   semantics exactly; the `sqlite` module documents the storage layout.
+//! - `SqliteSessionService` and `SqliteArtifactService` (feature `sqlite`) write
+//!   threads, history, scoped state, and versioned artifacts to a database file,
+//!   so a conversation — or a suspended human-in-the-loop run, or a generated
+//!   report — survives a restart. They reproduce the in-memory semantics
+//!   exactly; `SqliteStore` opens one database and hands out both, and the
+//!   `sqlite` module documents the storage layout.
 //!
 //! # Example
 //!
@@ -45,7 +47,7 @@ pub use in_memory::{
 };
 
 #[cfg(feature = "sqlite")]
-pub use sqlite::SqliteSessionService;
+pub use sqlite::{SqliteArtifactService, SqliteSessionService, SqliteStore};
 
 #[cfg(test)]
 mod tests {

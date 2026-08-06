@@ -99,9 +99,9 @@ pub mod prelude {
         SequentialAgent, SharedAgent,
     };
     pub use crate::core::{
-        AdkError, Args, Content, Event, EventActions, FunctionCall, FunctionDeclaration,
-        FunctionResponse, InvocationContext, NodeInfo, Part, Result, Role, RunConfig, Schema,
-        SchemaType, Services, Session, SessionService, State, StreamingMode,
+        AdkError, Args, ArtifactService, Content, Event, EventActions, FunctionCall,
+        FunctionDeclaration, FunctionResponse, InvocationContext, NodeInfo, Part, Result, Role,
+        RunConfig, Schema, SchemaType, Services, Session, SessionService, State, StreamingMode,
     };
     pub use crate::graph::{
         chain, concat, constant_node, Edge, EdgeBuilder, FunctionNode, Graph, JoinNode, Node,
@@ -111,11 +111,11 @@ pub mod prelude {
         GenerateContentConfig, LlmRequest, LlmResponse, MockModel, Model, ModelRegistry,
     };
     pub use crate::runner::Runner;
-    #[cfg(feature = "sqlite")]
-    pub use crate::sessions::SqliteSessionService;
     pub use crate::sessions::{
         InMemoryArtifactService, InMemoryMemoryService, InMemorySessionService,
     };
+    #[cfg(feature = "sqlite")]
+    pub use crate::sessions::{SqliteArtifactService, SqliteSessionService, SqliteStore};
     pub use crate::tools::{
         invoke_tool, FunctionTool, SharedTool, StaticToolset, Tool, ToolContext, ToolSource,
         Toolset,
@@ -180,10 +180,10 @@ mod tests {
         );
     }
 
-    /// A conversation outlives the process that started it.
+    /// A conversation, and the files it produced, outlive the process.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn a_sqlite_session_survives_a_restart() {
+    async fn a_sqlite_store_survives_a_restart() {
         let path =
             std::env::temp_dir().join(format!("{}.sqlite3", crate::core::new_id("rusty-adk-test")));
 
@@ -196,14 +196,10 @@ mod tests {
                 .shared()
         };
 
-        // First "process": ask one question, then drop everything.
+        // First "process": ask one question, save a file, then drop everything.
         let session_id = {
-            let sessions = SqliteSessionService::open(&path).await.unwrap();
-            let runner = Runner::new(
-                "support_app",
-                agent("Paris."),
-                Services::new(Arc::new(sessions)),
-            );
+            let store = SqliteStore::open(&path).await.unwrap();
+            let runner = Runner::new("support_app", agent("Paris."), store.services());
             let session = runner.create_session("u1", None).await.unwrap();
             runner
                 .run_to_completion(
@@ -214,21 +210,38 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            store
+                .artifacts()
+                .save_artifact(
+                    "support_app",
+                    "u1",
+                    &session.id,
+                    "answer.md",
+                    Part::text("Paris."),
+                )
+                .await
+                .unwrap();
             session.id
         };
 
-        // Second "process": a fresh service over the same file picks the thread
-        // back up with its history and state intact.
-        let sessions = SqliteSessionService::open(&path).await.unwrap();
-        let runner = Runner::new(
-            "support_app",
-            agent("Berlin."),
-            Services::new(Arc::new(sessions)),
-        );
+        // Second "process": a fresh store over the same file picks the thread
+        // back up with its history, state, and artifacts intact.
+        let store = SqliteStore::open(&path).await.unwrap();
+        let runner = Runner::new("support_app", agent("Berlin."), store.services());
 
         let resumed = runner.session("u1", &session_id).await.unwrap().unwrap();
         assert_eq!(resumed.state.get("last_answer").unwrap(), "Paris.");
         assert!(resumed.events.iter().any(|e| e.text() == "Paris."));
+
+        let artifacts = store.artifacts();
+        assert_eq!(
+            artifacts
+                .load_artifact("support_app", "u1", &session_id, "answer.md", None)
+                .await
+                .unwrap()
+                .unwrap(),
+            Part::text("Paris.")
+        );
 
         runner
             .run_to_completion(
@@ -244,6 +257,20 @@ mod tests {
         assert_eq!(after.state.get("last_answer").unwrap(), "Berlin.");
         // The second turn appended to the first rather than starting over.
         assert!(after.events.len() > resumed.events.len());
+        // And the artifact's version sequence continued rather than restarting.
+        assert_eq!(
+            artifacts
+                .save_artifact(
+                    "support_app",
+                    "u1",
+                    &session_id,
+                    "answer.md",
+                    Part::text("Berlin.")
+                )
+                .await
+                .unwrap(),
+            1
+        );
 
         let _ = std::fs::remove_file(&path);
     }

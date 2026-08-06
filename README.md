@@ -56,7 +56,7 @@ This port implements:
 | **Agents** | `LlmAgent` with the full tool-calling loop, `SequentialAgent`, `ParallelAgent`, `LoopAgent`, `AgentNode` |
 | **Callbacks** | before/after agent, model, and tool — returning a value replaces the wrapped step |
 | **Runtime** | `Runner`'s yield → commit → resume loop, streaming, cancellation |
-| **Services** | `SessionService`, `ArtifactService`, `MemoryService` traits, with in-memory implementations and a persistent SQLite `SessionService` |
+| **Services** | `SessionService`, `ArtifactService`, `MemoryService` traits, with in-memory implementations and persistent SQLite session and artifact stores |
 | **Models** | `Model` trait, `MockModel`, Gemini and Anthropic connectors |
 | **Interop** | MCP server (stdio + streamable HTTP) and MCP client toolset |
 
@@ -84,7 +84,7 @@ rusty-adk = { version = "0.1", default-features = false, features = ["macros"] }
 | `macros` | the `#[adk_tool]` attribute | yes |
 | `mcp` | the MCP server and client transports | yes |
 | `models` | the Gemini and Anthropic connectors | yes |
-| `sqlite` | `SqliteSessionService`, a durable session store | no |
+| `sqlite` | `SqliteStore` — durable session and artifact services | no |
 
 ## Concepts
 
@@ -123,23 +123,28 @@ A write becomes durable only once the `Runner` has processed the event carrying
 its delta. That ordering is the contract: code resuming after a yielded event
 can rely on its state having landed.
 
-### Sessions
+### Sessions and artifacts
 
-`InMemorySessionService` is the default and keeps everything in process memory —
-right for tests and one-shot scripts. Enable the `sqlite` feature for a store
+The in-memory services are the default and keep everything in process memory —
+right for tests and one-shot scripts. Enable the `sqlite` feature for storage
 that outlives the process:
 
 ```rust
-let sessions = SqliteSessionService::open("sessions.db").await?;
-let services = Services::new(Arc::new(sessions));
+let store = SqliteStore::open("agent.db").await?;
+let services = store.services();  // sessions + artifacts, one database
 ```
 
-It reproduces the in-memory semantics exactly — the same prefix routing, the
+Take them individually with `store.sessions()` and `store.artifacts()`, or open
+either on its own with `SqliteSessionService::open` /
+`SqliteArtifactService::open`.
+
+Both reproduce the in-memory semantics exactly — the same prefix routing, the
 same hydration of `app:` and `user:` values onto each thread, the same refusal
-to record partial events — so switching backends changes durability and nothing
-else. Threads, history, and each state scope get their own table; `temp:` keys
-get none, which is what makes them temporary. Events are stored as JSON rather
-than as columns, so schema additions like 2.0's `node_info` and `output`
+to record partial events, the same per-filename artifact versioning — so
+switching backends changes durability and nothing else. Threads, history, each
+state scope, and artifacts get their own table; `temp:` keys get none, which is
+what makes them temporary. Events and artifact payloads are stored as JSON
+rather than as columns, so schema additions like 2.0's `node_info` and `output`
 round-trip without a migration.
 
 That durability is what makes a suspended human-in-the-loop run resumable after
