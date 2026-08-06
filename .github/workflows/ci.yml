@@ -36,6 +36,9 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets
 
+      - name: Test (SQLite sessions)
+        run: cargo test --workspace --features rusty-adk/sqlite,adk-sessions/sqlite
+
       - name: Doc tests
         run: cargo test --workspace --doc
 
@@ -87,6 +90,9 @@ jobs:
 
       - name: Models only
         run: cargo check -p rusty-adk --no-default-features --features models
+
+      - name: SQLite sessions only
+        run: cargo check -p rusty-adk --no-default-features --features sqlite
 
       - name: MCP transports individually
         run: |

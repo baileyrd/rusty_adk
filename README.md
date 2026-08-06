@@ -56,7 +56,7 @@ This port implements:
 | **Agents** | `LlmAgent` with the full tool-calling loop, `SequentialAgent`, `ParallelAgent`, `LoopAgent`, `AgentNode` |
 | **Callbacks** | before/after agent, model, and tool — returning a value replaces the wrapped step |
 | **Runtime** | `Runner`'s yield → commit → resume loop, streaming, cancellation |
-| **Services** | `SessionService`, `ArtifactService`, `MemoryService` traits with in-memory implementations |
+| **Services** | `SessionService`, `ArtifactService`, `MemoryService` traits, with in-memory implementations and a persistent SQLite `SessionService` |
 | **Models** | `Model` trait, `MockModel`, Gemini and Anthropic connectors |
 | **Interop** | MCP server (stdio + streamable HTTP) and MCP client toolset |
 
@@ -78,6 +78,13 @@ live model connectors. Trim what you don't need:
 ```toml
 rusty-adk = { version = "0.1", default-features = false, features = ["macros"] }
 ```
+
+| Feature | Brings in | Default |
+|---|---|---|
+| `macros` | the `#[adk_tool]` attribute | yes |
+| `mcp` | the MCP server and client transports | yes |
+| `models` | the Gemini and Anthropic connectors | yes |
+| `sqlite` | `SqliteSessionService`, a durable session store | no |
 
 ## Concepts
 
@@ -115,6 +122,29 @@ them:
 A write becomes durable only once the `Runner` has processed the event carrying
 its delta. That ordering is the contract: code resuming after a yielded event
 can rely on its state having landed.
+
+### Sessions
+
+`InMemorySessionService` is the default and keeps everything in process memory —
+right for tests and one-shot scripts. Enable the `sqlite` feature for a store
+that outlives the process:
+
+```rust
+let sessions = SqliteSessionService::open("sessions.db").await?;
+let services = Services::new(Arc::new(sessions));
+```
+
+It reproduces the in-memory semantics exactly — the same prefix routing, the
+same hydration of `app:` and `user:` values onto each thread, the same refusal
+to record partial events — so switching backends changes durability and nothing
+else. Threads, history, and each state scope get their own table; `temp:` keys
+get none, which is what makes them temporary. Events are stored as JSON rather
+than as columns, so schema additions like 2.0's `node_info` and `output`
+round-trip without a migration.
+
+That durability is what makes a suspended human-in-the-loop run resumable after
+a restart: the interrupt's resume point is ordinary session state, so it lands
+in the database with everything else.
 
 ### Graphs
 

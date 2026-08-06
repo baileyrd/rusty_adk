@@ -27,7 +27,7 @@ adk-runner  adk-mcp     adk-agents     adk-macros      │
 | `adk-tools` | The `Tool` trait, `ToolContext`, toolsets, and the framing behaviour around a call. |
 | `adk-graph` | The ADK 2.0 workflow graph engine. |
 | `adk-models` | The `Model` trait and provider connectors. |
-| `adk-sessions` | In-memory `SessionService` / `ArtifactService` / `MemoryService`. |
+| `adk-sessions` | `SessionService` / `ArtifactService` / `MemoryService` backends: in-memory, plus a SQLite session store behind the `sqlite` feature. |
 | `adk-agents` | `LlmAgent`, the workflow agents, callbacks, and the graph bridge. |
 | `adk-runner` | The runtime event loop. |
 | `adk-macros` | `#[adk_tool]`. |
@@ -102,6 +102,37 @@ forever.
 Re-running the node rather than resuming mid-body is what ADK's Go engine does
 (`RerunOnResume`), and it means node code does not have to be restructured into
 a state machine around each suspension point.
+
+### Session persistence
+
+A `SessionService` is where a conversation, its scoped state, and any suspended
+resume point actually live, so the choice of backend decides whether a run can
+outlive its process. Two ship here, and they are behaviourally identical:
+
+| | `InMemorySessionService` | `SqliteSessionService` (feature `sqlite`) |
+|---|---|---|
+| Storage | `BTreeMap`s behind a mutex | a SQLite file, WAL mode |
+| Survives restart | no | yes |
+| Scoped state | three maps, keyed by app / (app, user) / thread | three tables, same keys |
+| History | a `Vec` on the session | one row per event, ordered by `seq` |
+
+The SQLite schema keeps each state scope in its own table — `app_state`,
+`user_state`, `session_state` — with keys stored **including** their prefixes, so
+reassembling the flat view an agent sees is a three-query merge in the same order
+the in-memory service merges its maps. `temp:` keys have no table at all: they
+are dropped on the way in, which is what makes them temporary.
+
+Events are stored as serialized JSON in a single `payload` column rather than as
+a column per field. ADK 2.0's addition of `node_info` and `output` is exactly the
+case where a rigid-column store needs widening and a JSON store does not, so new
+event fields round-trip with no migration. `PRAGMA user_version` still records
+the schema version, for changes that do need one.
+
+`rusqlite` is blocking, so every query runs on `tokio::task::spawn_blocking` with
+the connection lock taken *inside* the blocking closure — consistent with the
+"locks are never held across an await" rule below. Busy and locked conditions map
+to `AdkError::Storage { retryable: true }`; constraint violations map to the same
+variant with `retryable: false`, so callers need not parse error strings.
 
 ## Deviations from the reference SDKs
 

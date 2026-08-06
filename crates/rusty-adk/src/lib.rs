@@ -16,7 +16,7 @@
 //! | [`graph`] | The 2.0 workflow graph engine: nodes, routes, joins, interrupts |
 //! | [`agents`] | `LlmAgent`, the workflow agents, callbacks |
 //! | [`models`] | The `Model` trait, `MockModel`, Gemini and Anthropic connectors |
-//! | [`sessions`] | In-memory session, artifact, and memory services |
+//! | [`sessions`] | Session, artifact, and memory services — in-memory, or SQLite-backed with the `sqlite` feature |
 //! | [`runner`] | The runtime event loop |
 //! | [`mcp`] | MCP transports, for interoperating with ADK agents in other languages |
 //!
@@ -111,6 +111,8 @@ pub mod prelude {
         GenerateContentConfig, LlmRequest, LlmResponse, MockModel, Model, ModelRegistry,
     };
     pub use crate::runner::Runner;
+    #[cfg(feature = "sqlite")]
+    pub use crate::sessions::SqliteSessionService;
     pub use crate::sessions::{
         InMemoryArtifactService, InMemoryMemoryService, InMemorySessionService,
     };
@@ -176,6 +178,74 @@ mod tests {
             saved.state.get("last_answer").unwrap(),
             "It is sunny in Paris."
         );
+    }
+
+    /// A conversation outlives the process that started it.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_sqlite_session_survives_a_restart() {
+        let path =
+            std::env::temp_dir().join(format!("{}.sqlite3", crate::core::new_id("rusty-adk-test")));
+
+        let agent = |reply: &str| {
+            LlmAgent::builder("assistant")
+                .model(Arc::new(MockModel::new().push_text(reply)))
+                .output_key("last_answer")
+                .build()
+                .unwrap()
+                .shared()
+        };
+
+        // First "process": ask one question, then drop everything.
+        let session_id = {
+            let sessions = SqliteSessionService::open(&path).await.unwrap();
+            let runner = Runner::new(
+                "support_app",
+                agent("Paris."),
+                Services::new(Arc::new(sessions)),
+            );
+            let session = runner.create_session("u1", None).await.unwrap();
+            runner
+                .run_to_completion(
+                    "u1",
+                    &session.id,
+                    Content::user_text("Capital of France?"),
+                    None,
+                )
+                .await
+                .unwrap();
+            session.id
+        };
+
+        // Second "process": a fresh service over the same file picks the thread
+        // back up with its history and state intact.
+        let sessions = SqliteSessionService::open(&path).await.unwrap();
+        let runner = Runner::new(
+            "support_app",
+            agent("Berlin."),
+            Services::new(Arc::new(sessions)),
+        );
+
+        let resumed = runner.session("u1", &session_id).await.unwrap().unwrap();
+        assert_eq!(resumed.state.get("last_answer").unwrap(), "Paris.");
+        assert!(resumed.events.iter().any(|e| e.text() == "Paris."));
+
+        runner
+            .run_to_completion(
+                "u1",
+                &session_id,
+                Content::user_text("And of Germany?"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let after = runner.session("u1", &session_id).await.unwrap().unwrap();
+        assert_eq!(after.state.get("last_answer").unwrap(), "Berlin.");
+        // The second turn appended to the first rather than starting over.
+        assert!(after.events.len() > resumed.events.len());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 description = "Session, artifact, and memory service implementations for the Rust ADK"
 
+[features]
+default = []
+# A durable SessionService backed by SQLite. `bundled` compiles SQLite itself,
+# so nothing needs to be installed on the host.
+sqlite = ["dep:rusqlite", "tokio/rt"]
+
 [dependencies]
 adk-core.workspace = true
 async-trait.workspace = true
@@ -14,7 +20,13 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
+# Held at 0.37: newer libsqlite3-sys build scripts need `cfg_select!`, which is
+# not stable on this workspace's MSRV.
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tokio-test.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

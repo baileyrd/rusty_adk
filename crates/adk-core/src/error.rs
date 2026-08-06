@@ -76,6 +76,19 @@ pub enum AdkError {
         message: String,
     },
 
+    /// A persistent store rejected an operation.
+    ///
+    /// `retryable` distinguishes a transient condition — a locked or busy
+    /// database, a dropped connection — from a permanent one such as a
+    /// constraint violation, so callers need not parse the message.
+    #[error("storage error: {message}")]
+    Storage {
+        /// What the store reported.
+        message: String,
+        /// Whether the same operation could succeed if tried again.
+        retryable: bool,
+    },
+
     /// A configuration value was missing or contradictory.
     #[error("configuration error: {0}")]
     Config(String),
@@ -126,6 +139,22 @@ impl AdkError {
         }
     }
 
+    /// Builds a permanent storage failure.
+    pub fn storage(message: impl Into<String>) -> Self {
+        AdkError::Storage {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    /// Builds a transient storage failure, such as a busy or locked database.
+    pub fn storage_retryable(message: impl Into<String>) -> Self {
+        AdkError::Storage {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
     /// True when this is a control-flow signal rather than a failure.
     ///
     /// The graph engine's retry logic consults this so it never retries a
@@ -143,6 +172,7 @@ impl AdkError {
             _ if self.is_control_flow() => false,
             AdkError::Model { .. } | AdkError::Io(_) => true,
             AdkError::Tool { .. } => true,
+            AdkError::Storage { retryable, .. } => *retryable,
             _ => false,
         }
     }
@@ -159,6 +189,7 @@ impl AdkError {
             AdkError::SessionNotFound(_) => "SESSION_NOT_FOUND",
             AdkError::ArtifactNotFound(_) => "ARTIFACT_NOT_FOUND",
             AdkError::Validation { .. } => "VALIDATION_ERROR",
+            AdkError::Storage { .. } => "STORAGE_ERROR",
             AdkError::Config(_) => "CONFIG_ERROR",
             AdkError::LimitExceeded(_) => "LIMIT_EXCEEDED",
             AdkError::Cancelled => "CANCELLED",
@@ -190,5 +221,11 @@ mod tests {
     #[test]
     fn validation_errors_are_not_retryable() {
         assert!(!AdkError::validation("city", "required").is_retryable());
+    }
+
+    #[test]
+    fn storage_errors_carry_their_own_retryability() {
+        assert!(AdkError::storage_retryable("database is locked").is_retryable());
+        assert!(!AdkError::storage("UNIQUE constraint failed").is_retryable());
     }
 }

@@ -19,6 +19,8 @@ macros = ["dep:adk-macros"]
 mcp = ["dep:adk-mcp"]
 # Live model connectors (Gemini, Anthropic).
 models = ["adk-models/gemini", "adk-models/anthropic"]
+# A durable, SQLite-backed SessionService.
+sqlite = ["adk-sessions/sqlite"]
 
 [dependencies]
 adk-core.workspace = true

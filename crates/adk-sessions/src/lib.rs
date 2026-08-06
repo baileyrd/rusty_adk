@@ -2,7 +2,15 @@
 //!
 //! The traits themselves live in [`adk_core::services`] so that every crate
 //! can depend on the abstraction without pulling in a backend. This crate
-//! provides the implementations.
+//! provides the implementations:
+//!
+//! - [`InMemorySessionService`], [`InMemoryArtifactService`], and
+//!   [`InMemoryMemoryService`] keep everything in process memory. They are the
+//!   right default for tests and for a single-run script.
+//! - `SqliteSessionService` (feature `sqlite`) writes threads, history, and
+//!   scoped state to a database file, so a conversation — or a suspended
+//!   human-in-the-loop run — survives a restart. It reproduces the in-memory
+//!   semantics exactly; the `sqlite` module documents the storage layout.
 //!
 //! # Example
 //!
@@ -29,10 +37,15 @@
 #![warn(clippy::all)]
 
 pub mod in_memory;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 
 pub use in_memory::{
     memory_entry, InMemoryArtifactService, InMemoryMemoryService, InMemorySessionService,
 };
+
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteSessionService;
 
 #[cfg(test)]
 mod tests {
