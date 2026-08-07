@@ -35,7 +35,7 @@ itself; it contributes the bridge, not an A2A implementation.
 | `adk-runner` | The runtime event loop. |
 | `adk-macros` | `#[adk_tool]`. |
 | `adk-mcp` | MCP server and client: cross-SDK interop for tools. |
-| `adk-a2a` | An `AgentExecutor` backed by a `Runner`: cross-SDK interop for agents. |
+| `adk-a2a` | Cross-SDK interop for agents, both ways: an `AgentExecutor` backed by a `Runner`, and an `Agent` backed by an A2A client. |
 | `rusty-adk` | Facade and prelude. |
 
 Service **traits** live in `adk-core` rather than `adk-sessions` so that every
@@ -240,6 +240,24 @@ message on the same task carries the answer back to the node that asked.
 **Partial events are not forwarded.** A2A streams task state and artifacts, not
 tokens. A status update per token would be noise and a misuse of the field, so
 callers see `Working`, then artifacts as they land, then a terminal status.
+
+`RemoteA2aAgent` is the same bridge pointed the other way: a remote A2A agent
+implementing ADK's `Agent` trait, so it composes as a sub-agent or a graph node.
+It takes its description from the remote's card — the remote is the authority on
+what it does, and that description is what a local model reads when deciding to
+delegate. Remote statuses become ordinary ADK events: a terminal message is the
+final response, `InputRequired` becomes an event carrying `RequestInput`, a
+failure carries an error code, and artifacts are saved into the local
+`ArtifactService` so the rest of the run can reach them.
+
+Continuing a remote task is the part with a trap in it. The remote's task id
+lives in session state under `a2a:<name>:task_id`, which means it obeys the
+staging rule above: **a write only persists when an event carries its delta.**
+Staging the id after the last event was yielded left it un-persisted, so every
+follow-up turn opened a fresh remote task and a remote question could never be
+answered. The id is now staged as soon as it is known and attached to the next
+event on the way out, with a carrier event for anything left over — the same
+shape the graph engine uses for its own resume record, and for the same reason.
 
 ## Design decisions worth knowing
 

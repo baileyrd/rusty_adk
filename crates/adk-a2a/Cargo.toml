@@ -12,6 +12,7 @@ adk-agents.workspace = true
 adk-core.workspace = true
 adk-graph.workspace = true
 adk-runner.workspace = true
+async-stream.workspace = true
 async-trait.workspace = true
 base64 = "0.22"
 futures.workspace = true
@@ -23,6 +24,7 @@ tracing.workspace = true
 # leaves transport to that crate's `AgentServer`.
 rusty_a2a = { git = "https://github.com/baileyrd/rusty_a2a", default-features = false, features = [
   "server",
+  "client",
 ] }
 
 [dev-dependencies]

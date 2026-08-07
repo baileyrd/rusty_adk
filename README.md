@@ -58,7 +58,7 @@ This port implements:
 | **Runtime** | `Runner`'s yield → commit → resume loop, streaming, cancellation |
 | **Services** | `SessionService`, `ArtifactService`, `MemoryService` traits, each with an in-memory and a persistent SQLite implementation |
 | **Models** | `Model` trait, `MockModel`, Gemini and Anthropic connectors |
-| **Interop** | MCP server (stdio + streamable HTTP) and MCP client toolset for *tools*; an A2A bridge for *agents* |
+| **Interop** | MCP server (stdio + streamable HTTP) and MCP client toolset for *tools*; A2A in both directions for *agents* |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how the pieces fit together, and for
 the places where a Rust idiom differs from the reference SDKs.
@@ -85,7 +85,7 @@ rusty-adk = { version = "0.1", default-features = false, features = ["macros"] }
 | `mcp` | the MCP server and client transports | yes |
 | `models` | the Gemini and Anthropic connectors | yes |
 | `sqlite` | `SqliteStore` — durable session, artifact, and memory services | no |
-| `a2a` | Serve this agent over Agent2Agent, via `adk-a2a` | no |
+| `a2a` | Agent2Agent in both directions, via `adk-a2a` | no |
 
 ## Concepts
 
@@ -238,6 +238,27 @@ weather = RemoteA2aAgent(
 One A2A `contextId` is one ADK session, and — the mapping worth having — an ADK
 graph suspension becomes an A2A `InputRequired` task that the caller's next
 message on that task resumes. See the `a2a-agent-server` example.
+
+The reverse works too. `RemoteA2aAgent` makes a remote A2A agent implement
+ADK's `Agent` trait, so it can be a sub-agent or a graph node like any local
+one:
+
+```rust
+let researcher = RemoteA2aAgent::discover("researcher", "http://localhost:8080").await?;
+
+let root = LlmAgent::builder("concierge")
+    .model(model)
+    .instruction("Delegate research questions to researcher.")
+    .sub_agent(researcher.shared())
+    .build()?;
+```
+
+Its description comes from the remote's own agent card, so what the local model
+reads when deciding to delegate is what the remote says it does. A remote task
+left mid-way — because it asked a question — is remembered in session state and
+continued on the next turn, which is how a remote `InputRequired` gets answered.
+The two directions compose: an ADK agent served over A2A can itself delegate to
+another one.
 
 ## Examples
 

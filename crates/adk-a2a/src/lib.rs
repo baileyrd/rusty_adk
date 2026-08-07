@@ -46,11 +46,13 @@
 //! at the node that suspended. Both sides already had the concept; the bridge
 //! only has to line them up.
 //!
-//! # Direction
+//! # Both directions
 //!
-//! This crate serves an ADK agent *to* A2A callers. Calling *out* to a remote
-//! A2A agent from inside an ADK run is the mirror image and is not implemented
-//! here — use `rusty_a2a`'s client directly from a tool.
+//! [`AdkAgentExecutor`] serves an ADK agent *to* A2A callers.
+//! [`RemoteA2aAgent`] is the mirror: a remote A2A agent that implements ADK's
+//! `Agent` trait, so it can be a sub-agent or a graph node like any local one.
+//! Together they compose — an ADK agent served over A2A can itself delegate to
+//! another one, and neither end has to know how far the other is.
 //!
 //! [a2a]: https://a2a-protocol.org/latest/
 
@@ -60,10 +62,12 @@
 pub mod card;
 pub mod convert;
 pub mod executor;
+pub mod remote;
 
 pub use card::card_for_agent;
 pub use convert::{content_to_message, message_to_content, part_to_a2a, part_to_adk};
 pub use executor::{AdkAgentExecutor, UserResolver};
+pub use remote::RemoteA2aAgent;
 
 /// Re-exported so a consumer needs only this crate to build a server.
 pub use rusty_a2a;
