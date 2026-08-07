@@ -18,7 +18,8 @@
 //! | [`models`] | The `Model` trait, `MockModel`, Gemini and Anthropic connectors |
 //! | [`sessions`] | Session, artifact, and memory services — in-memory, or SQLite-backed with the `sqlite` feature |
 //! | [`runner`] | The runtime event loop |
-//! | [`mcp`] | MCP transports, for interoperating with ADK agents in other languages |
+//! | [`mcp`] | MCP transports: serve Rust tools to an ADK agent in any language |
+//! | `a2a` | The Agent2Agent bridge (feature `a2a`): serve this agent to any A2A caller |
 //!
 //! # Getting started
 //!
@@ -84,6 +85,9 @@ pub use adk_tools as tools;
 
 #[cfg(feature = "mcp")]
 pub use adk_mcp as mcp;
+
+#[cfg(feature = "a2a")]
+pub use adk_a2a as a2a;
 
 #[cfg(feature = "macros")]
 pub use adk_macros::adk_tool;

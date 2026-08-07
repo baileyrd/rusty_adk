@@ -58,7 +58,7 @@ This port implements:
 | **Runtime** | `Runner`'s yield → commit → resume loop, streaming, cancellation |
 | **Services** | `SessionService`, `ArtifactService`, `MemoryService` traits, with in-memory implementations and persistent SQLite session and artifact stores |
 | **Models** | `Model` trait, `MockModel`, Gemini and Anthropic connectors |
-| **Interop** | MCP server (stdio + streamable HTTP) and MCP client toolset |
+| **Interop** | MCP server (stdio + streamable HTTP) and MCP client toolset for *tools*; an A2A bridge for *agents* |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how the pieces fit together, and for
 the places where a Rust idiom differs from the reference SDKs.
@@ -85,6 +85,7 @@ rusty-adk = { version = "0.1", default-features = false, features = ["macros"] }
 | `mcp` | the MCP server and client transports | yes |
 | `models` | the Gemini and Anthropic connectors | yes |
 | `sqlite` | `SqliteStore` — durable session and artifact services | no |
+| `a2a` | Serve this agent over Agent2Agent, via `adk-a2a` | no |
 
 ## Concepts
 
@@ -204,6 +205,30 @@ McpToolset(connection_params=StdioConnectionParams(
 
 The reverse works too: `McpToolset` in this crate consumes any MCP server's
 tools as ADK tools.
+
+### Agents: A2A
+
+ADK's SDKs *do* share a protocol for agents — A2A — and the `a2a` feature
+serves a Rust ADK agent over it, so an agent in any language can delegate here:
+
+```rust
+let runner = Runner::new("weather_app", agent.shared(), services);
+let card = card_for_agent(&agent.shared(), "0.1.0", AgentInterface::json_rpc(&url));
+let router = AgentServer::new(card, Arc::new(AdkAgentExecutor::new(Arc::new(runner))))
+    .into_router();
+```
+
+```python
+weather = RemoteA2aAgent(
+    name="rust_weather",
+    description="A weather agent implemented in Rust.",
+    agent_card="http://127.0.0.1:8080/.well-known/agent-card.json",
+)
+```
+
+One A2A `contextId` is one ADK session, and — the mapping worth having — an ADK
+graph suspension becomes an A2A `InputRequired` task that the caller's next
+message on that task resumes. See the `a2a-agent-server` example.
 
 ## Examples
 

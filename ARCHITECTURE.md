@@ -10,15 +10,18 @@ Dependencies point downward; nothing below depends on anything above.
 ```
                         rusty-adk  (facade + prelude)
                              │
-   ┌──────────┬──────────────┼──────────────┬──────────┐
-   │          │              │              │          │
-adk-runner  adk-mcp     adk-agents     adk-macros      │
-   │          │         │    │    │                    │
-   │          │         │    │    └──── adk-models ────┤
-   │          │         │    └───────── adk-graph ─────┤
-   │          └─────────┴──────────────  adk-tools ────┤
-   │                                                   │
-   └────────────────── adk-sessions ─────────────── adk-core
+   ┌──────────┬──────────┬───┴──────┬──────────────┬──────────┐
+   │          │          │          │              │          │
+adk-a2a   adk-runner  adk-mcp   adk-agents    adk-macros      │
+   │          │          │      │    │    │                   │
+   └──────────┤          │      │    │    └──── adk-models ───┤
+              │          │      │    └───────── adk-graph ────┤
+              │          └──────┴─────────────  adk-tools ────┤
+              │                                               │
+              └────────── adk-sessions ─────────────────── adk-core
+
+`adk-a2a` also depends on the external `rusty_a2a` crate for the protocol
+itself; it contributes the bridge, not an A2A implementation.
 ```
 
 | Crate | Responsibility |
@@ -31,7 +34,8 @@ adk-runner  adk-mcp     adk-agents     adk-macros      │
 | `adk-agents` | `LlmAgent`, the workflow agents, callbacks, and the graph bridge. |
 | `adk-runner` | The runtime event loop. |
 | `adk-macros` | `#[adk_tool]`. |
-| `adk-mcp` | MCP server and client, for cross-SDK interop. |
+| `adk-mcp` | MCP server and client: cross-SDK interop for tools. |
+| `adk-a2a` | An `AgentExecutor` backed by a `Runner`: cross-SDK interop for agents. |
 | `rusty-adk` | Facade and prelude. |
 
 Service **traits** live in `adk-core` rather than `adk-sessions` so that every
@@ -186,12 +190,33 @@ rather than a startup failure. Because a proc macro cannot know how the caller
 reached the ADK, generated paths route through one module and are redirectable
 with `#[adk_tool(crate = ::rusty_adk::tools)]`.
 
-### Interop is MCP, because ADK has no tool wire protocol
+### Interop is MCP for tools and A2A for agents
 
 ADK's SDKs share a protocol for *agents* (A2A) but not for tools; a tool is an
 in-process object in each language. The one path a Rust tool has into a Python,
 Go, TypeScript, Java, or Kotlin agent is MCP, which every ADK SDK consumes via
 `McpToolset`. `adk-mcp` therefore implements both directions.
+
+For agents there *is* a protocol, so `adk-a2a` (feature `a2a` on the facade)
+implements A2A's `AgentExecutor` over a `Runner`, using the `rusty_a2a` crate
+for the protocol itself. The mapping is documented on `AdkAgentExecutor`; three
+choices are worth naming here.
+
+**One A2A `contextId` is one ADK session.** A2A carries no user identity on a
+message, so by default the `contextId` is also the ADK user id. That is the
+conservative reading — it keeps one conversation's `user:`-scoped state out of
+another's — at the cost of sharing nothing across a caller's conversations. An
+application that knows who is calling supplies a resolver.
+
+**A graph suspension is an `InputRequired` task.** Both protocols already model
+waiting for a person, so the bridge only has to line them up: the graph engine
+persists its own resume record under `adk:graph_pending`, and the bridge reads
+that rather than keeping a second copy that could drift. The caller's next
+message on the same task carries the answer back to the node that asked.
+
+**Partial events are not forwarded.** A2A streams task state and artifacts, not
+tokens. A status update per token would be noise and a misuse of the field, so
+callers see `Working`, then artifacts as they land, then a terminal status.
 
 ## Design decisions worth knowing
 

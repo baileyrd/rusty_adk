@@ -10,9 +10,11 @@ members = [
     "crates/adk-agents",
     "crates/adk-runner",
     "crates/adk-mcp",
+    "crates/adk-a2a",
     "crates/rusty-adk",
     "examples/weather-agent",
     "examples/mcp-tool-server",
+    "examples/a2a-agent-server",
 ]
 
 [workspace.package]
@@ -36,6 +38,7 @@ adk-graph = { version = "0.1.0", path = "crates/adk-graph" }
 adk-agents = { version = "0.1.0", path = "crates/adk-agents" }
 adk-runner = { version = "0.1.0", path = "crates/adk-runner" }
 adk-mcp = { version = "0.1.0", path = "crates/adk-mcp" }
+adk-a2a = { version = "0.1.0", path = "crates/adk-a2a" }
 
 async-trait = "0.1"
 async-stream = "0.3"
