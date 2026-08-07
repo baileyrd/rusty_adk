@@ -119,7 +119,9 @@ pub mod prelude {
         InMemoryArtifactService, InMemoryMemoryService, InMemorySessionService,
     };
     #[cfg(feature = "sqlite")]
-    pub use crate::sessions::{SqliteArtifactService, SqliteSessionService, SqliteStore};
+    pub use crate::sessions::{
+        SqliteArtifactService, SqliteMemoryService, SqliteSessionService, SqliteStore,
+    };
     pub use crate::tools::{
         invoke_tool, FunctionTool, SharedTool, StaticToolset, Tool, ToolContext, ToolSource,
         Toolset,

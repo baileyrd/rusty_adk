@@ -1,12 +1,18 @@
-//! Durable [`SessionService`](adk_core::SessionService) and
-//! [`ArtifactService`](adk_core::ArtifactService) backends, on SQLite.
+//! Durable [`SessionService`](adk_core::SessionService),
+//! [`ArtifactService`](adk_core::ArtifactService), and
+//! [`MemoryService`](adk_core::MemoryService) backends, on SQLite.
 //!
 //! The in-memory services lose everything at process exit, which rules out the
-//! things sessions and artifacts exist to support: a conversation that spans
-//! restarts, a human-in-the-loop run that suspends now and resumes tomorrow, a
-//! generated file a user comes back for. These backends keep the same semantics
-//! — the prefix routing, the hydration, the refusal to record partial events,
-//! the per-filename versioning — and write them to a file.
+//! things these exist to support: a conversation that spans restarts, a
+//! human-in-the-loop run that suspends now and resumes tomorrow, a generated
+//! file a user comes back for, something a user said last week. The session and
+//! artifact backends keep the in-memory semantics exactly — the prefix routing,
+//! the hydration, the refusal to record partial events, the per-filename
+//! versioning — and write them to a file.
+//!
+//! [`SqliteMemoryService`] is the exception, and says why on its own docs: the
+//! in-memory recall is a self-declared placeholder rather than a contract, so
+//! this one uses FTS5 instead of reproducing it.
 //!
 //! # Storage layout
 //!
@@ -22,8 +28,8 @@
 //! `temp:` keys have no table: they are dropped on the way in, which is what
 //! makes them temporary.
 //!
-//! Events and artifact payloads are stored as serialized JSON rather than as
-//! columns per field. That is deliberate. ADK 2.0 added `node_info` and `output`
+//! Events, artifact payloads, and memory entries are stored as serialized JSON
+//! rather than as columns per field. That is deliberate. ADK 2.0 added `node_info` and `output`
 //! to the event schema, and a column-per-field store would have needed a
 //! migration to carry them; a JSON payload round-trips new fields with no schema
 //! change at all. [`SCHEMA_VERSION`] still tracks changes that do need one.
@@ -38,11 +44,11 @@
 //!
 //! # Example
 //!
-//! One database, both services:
+//! One database, all three services:
 //!
 //! ```
 //! # tokio_test::block_on(async {
-//! use adk_core::{Event, Part, SessionService, ArtifactService};
+//! use adk_core::{ArtifactService, Event, MemoryService, Part, SessionService};
 //! use adk_sessions::SqliteStore;
 //!
 //! let store = SqliteStore::in_memory().await?;
@@ -60,17 +66,24 @@
 //!     .await?;
 //! assert_eq!(version, 0);
 //!
-//! // `store.services()` bundles both for a Runner.
+//! // What the conversation said is recallable later, across sessions.
+//! store.memories().add_session_to_memory(&session).await?;
+//! let hits = store.memories().search_memory("app", "u1", "report").await?;
+//! assert_eq!(hits.len(), 1);
+//!
+//! // `store.services()` bundles all three for a Runner.
 //! let services = store.services();
-//! assert!(services.artifact.is_some());
+//! assert!(services.artifact.is_some() && services.memory.is_some());
 //! # Ok::<(), adk_core::AdkError>(())
 //! # }).unwrap();
 //! ```
 
 mod artifacts;
+mod memory;
 mod sessions;
 
 pub use artifacts::SqliteArtifactService;
+pub use memory::SqliteMemoryService;
 pub use sessions::SqliteSessionService;
 
 use adk_core::{AdkError, Result, Services};
@@ -89,7 +102,7 @@ pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema steps, applied in order from whatever version a file is already at.
-const MIGRATIONS: &[&str] = &[V1_SESSIONS, V2_ARTIFACTS];
+const MIGRATIONS: &[&str] = &[V1_SESSIONS, V2_ARTIFACTS, V3_MEMORIES];
 
 const V1_SESSIONS: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
@@ -155,6 +168,26 @@ CREATE TABLE IF NOT EXISTS artifacts (
     version  INTEGER NOT NULL,
     payload  TEXT    NOT NULL,
     PRIMARY KEY (app_name, user_id, scope, filename, version)
+);
+"#;
+
+/// Long-term memory, indexed for search by SQLite's FTS5 extension rather than
+/// stored in an ordinary table.
+///
+/// Everything except `text` is `UNINDEXED`: FTS5 would otherwise tokenize the
+/// ids and the serialized entry, so a search for a word that happened to appear
+/// inside a JSON payload would match. Only the recalled text is searchable.
+///
+/// `entry` is a whole serialized `MemoryEntry`, for the same reason events and
+/// artifacts are stored as JSON — FTS5 columns are typeless, and reconstructing
+/// one value beats reading a timestamp back out of a text column.
+const V3_MEMORIES: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(
+    app_name   UNINDEXED,
+    user_id    UNINDEXED,
+    session_id UNINDEXED,
+    entry      UNINDEXED,
+    text
 );
 "#;
 
@@ -289,11 +322,11 @@ impl Db {
     }
 }
 
-/// One SQLite database serving both sessions and artifacts.
+/// One SQLite database serving sessions, artifacts, and memory.
 ///
 /// Open the file once and take whichever services you need; they share the
-/// connection, so a session and the artifacts it produced land in the same
-/// database and the same transaction log.
+/// connection, so a session, the artifacts it produced, and what it left in
+/// memory all land in the same database and the same transaction log.
 ///
 /// ```
 /// # tokio_test::block_on(async {
@@ -348,19 +381,26 @@ impl SqliteStore {
         SqliteArtifactService::from_db(self.db.clone())
     }
 
-    /// Both services, bundled for a `Runner`.
+    /// The memory service on this database.
+    pub fn memories(&self) -> SqliteMemoryService {
+        SqliteMemoryService::from_db(self.db.clone())
+    }
+
+    /// All three services, bundled for a `Runner`.
     pub fn services(&self) -> Services {
-        Services::new(Arc::new(self.sessions())).with_artifact(Arc::new(self.artifacts()))
+        Services::new(Arc::new(self.sessions()))
+            .with_artifact(Arc::new(self.artifacts()))
+            .with_memory(Arc::new(self.memories()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adk_core::{ArtifactService, Part, SessionService};
+    use adk_core::{ArtifactService, Content, Event, MemoryService, Part, Session, SessionService};
 
     #[tokio::test]
-    async fn both_services_share_one_database() {
+    async fn all_three_services_share_one_database() {
         let store = SqliteStore::in_memory().await.unwrap();
         let sessions = store.sessions();
         let artifacts = store.artifacts();
@@ -374,34 +414,103 @@ mod tests {
             .await
             .unwrap();
 
-        // A service taken separately from the same store sees the write.
+        let mut remembered = session.clone();
+        remembered
+            .events
+            .push(Event::new("inv", "user").with_content(Content::user_text("about hiking")));
+        store
+            .memories()
+            .add_session_to_memory(&remembered)
+            .await
+            .unwrap();
+
+        // Services taken separately from the same store see those writes.
         assert!(store
             .artifacts()
             .load_artifact("app", "u1", &session.id, "notes.txt", None)
             .await
             .unwrap()
             .is_some());
+        assert_eq!(
+            store
+                .memories()
+                .search_memory("app", "u1", "hiking")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
+    /// A file written before artifacts and memory existed catches up on open,
+    /// rather than being refused or quietly missing its newer tables.
     #[tokio::test]
-    async fn a_v1_database_migrates_forward() {
-        // A file written before artifacts existed: schema v1, user_version 1.
+    async fn a_v1_database_migrates_all_the_way_forward() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(V1_SESSIONS).unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
 
         let store = SqliteStore::from_connection(conn).unwrap();
-        let session = store
+        let mut session = store
             .sessions()
             .create_session("app", "u1", None, None)
             .await
             .unwrap();
-        // The artifacts table was added by the migration, not by a fresh create.
+
+        // Both later tables exist because the migrations ran, not because a
+        // fresh database was created.
         store
             .artifacts()
             .save_artifact("app", "u1", &session.id, "f.txt", Part::text("x"))
             .await
             .unwrap();
+        session
+            .events
+            .push(Event::new("inv", "user").with_content(Content::user_text("about hiking")));
+        store
+            .memories()
+            .add_session_to_memory(&session)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .memories()
+                .search_memory("app", "u1", "hiking")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The step that matters for anyone already running the previous release:
+    /// v2 on disk, memory added on top.
+    #[tokio::test]
+    async fn a_v2_database_gains_the_memory_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(V1_SESSIONS).unwrap();
+        conn.execute_batch(V2_ARTIFACTS).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+
+        let store = SqliteStore::from_connection(conn).unwrap();
+        let mut session = Session::new("s1", "app", "u1");
+        session
+            .events
+            .push(Event::new("inv", "user").with_content(Content::user_text("about hiking")));
+        store
+            .memories()
+            .add_session_to_memory(&session)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .memories()
+                .search_memory("app", "u1", "hiking")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

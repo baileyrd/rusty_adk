@@ -19,10 +19,10 @@ adk-a2a   adk-runner  adk-mcp   adk-agents    adk-macros      │
               │          └──────┴─────────────  adk-tools ────┤
               │                                               │
               └────────── adk-sessions ─────────────────── adk-core
+```
 
 `adk-a2a` also depends on the external `rusty_a2a` crate for the protocol
 itself; it contributes the bridge, not an A2A implementation.
-```
 
 | Crate | Responsibility |
 |---|---|
@@ -30,7 +30,7 @@ itself; it contributes the bridge, not an A2A implementation.
 | `adk-tools` | The `Tool` trait, `ToolContext`, toolsets, and the framing behaviour around a call. |
 | `adk-graph` | The ADK 2.0 workflow graph engine. |
 | `adk-models` | The `Model` trait and provider connectors. |
-| `adk-sessions` | `SessionService` / `ArtifactService` / `MemoryService` backends: in-memory, plus SQLite session and artifact stores behind the `sqlite` feature. |
+| `adk-sessions` | `SessionService` / `ArtifactService` / `MemoryService` backends: in-memory, plus a SQLite implementation of all three behind the `sqlite` feature. |
 | `adk-agents` | `LlmAgent`, the workflow agents, callbacks, and the graph bridge. |
 | `adk-runner` | The runtime event loop. |
 | `adk-macros` | `#[adk_tool]`. |
@@ -110,9 +110,9 @@ a state machine around each suspension point.
 ### Persistence
 
 A `SessionService` is where a conversation, its scoped state, and any suspended
-resume point actually live; an `ArtifactService` holds the files a run produced.
-The choice of backend decides whether either outlives its process. Two of each
-ship here, and each pair is behaviourally identical:
+resume point actually live; an `ArtifactService` holds the files a run produced;
+a `MemoryService` holds what is recallable afterwards. The choice of backend
+decides whether any of it outlives the process. Two of each ship here:
 
 | | In-memory | SQLite (feature `sqlite`) |
 |---|---|---|
@@ -121,6 +121,7 @@ ship here, and each pair is behaviourally identical:
 | Scoped state | three maps, keyed by app / (app, user) / thread | three tables, same keys |
 | History | a `Vec` on the session | one row per event, ordered by `seq` |
 | Artifacts | a `Vec` per key, index = version | one row per key *and* version |
+| Memory | a `Vec` per (app, user), term-overlap scoring | an FTS5 index, BM25 ranking |
 
 The SQLite schema keeps each state scope in its own table — `app_state`,
 `user_state`, `session_state` — with keys stored **including** their prefixes, so
@@ -142,9 +143,31 @@ still records the schema version, and migrations apply forward from whatever
 version a file is already at — which is how the artifacts table reached databases
 written before it existed.
 
-`SqliteStore` opens the file once and hands out both services sharing one
-connection, so a session and the artifacts it produced land in the same database
-and the same transaction log. Either service can also be opened alone.
+**Memory is the one place the two backends deliberately differ.** For sessions
+and artifacts the in-memory implementation *is* the reference semantics, so the
+SQLite one reproduces it exactly. For memory it is not: `InMemoryMemoryService`
+documents its own retrieval as "enough to exercise memory-dependent agent logic
+in tests; swap in a real vector store for production recall". Reproducing a
+self-declared placeholder in a durable store, while ignoring the retrieval engine
+SQLite already ships, would be faithfulness to the wrong thing — so
+`SqliteMemoryService` indexes with FTS5 and ranks by BM25.
+
+What both still guarantee is what callers can actually depend on: isolation by
+(app, user), the same ingestion filter (no partial events, no empty text), and
+best-first ordering with a score where higher means more relevant. The scores are
+*not* comparable across backends — one is a bounded term-overlap fraction, the
+other unbounded BM25 — which is why `MemoryEntry::score` is documented as
+backend-specific relevance. FTS5 reads its `MATCH` argument as a query language,
+so a caller's prose is tokenized and each term quoted before it goes in;
+otherwise a stray `-`, `*`, or `NEAR` would silently change the search or fail
+it. Ingesting a session replaces its previous contribution, since a growing
+conversation is normally fed in more than once and duplicates no longer vanish
+at exit.
+
+`SqliteStore` opens the file once and hands out all three services sharing one
+connection, so a session, the artifacts it produced, and what it left in memory
+land in the same database and the same transaction log. Any service can also be
+opened alone.
 
 `rusqlite` is blocking, so every query runs on `tokio::task::spawn_blocking` with
 the connection lock taken *inside* the blocking closure — consistent with the

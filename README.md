@@ -56,7 +56,7 @@ This port implements:
 | **Agents** | `LlmAgent` with the full tool-calling loop, `SequentialAgent`, `ParallelAgent`, `LoopAgent`, `AgentNode` |
 | **Callbacks** | before/after agent, model, and tool — returning a value replaces the wrapped step |
 | **Runtime** | `Runner`'s yield → commit → resume loop, streaming, cancellation |
-| **Services** | `SessionService`, `ArtifactService`, `MemoryService` traits, with in-memory implementations and persistent SQLite session and artifact stores |
+| **Services** | `SessionService`, `ArtifactService`, `MemoryService` traits, each with an in-memory and a persistent SQLite implementation |
 | **Models** | `Model` trait, `MockModel`, Gemini and Anthropic connectors |
 | **Interop** | MCP server (stdio + streamable HTTP) and MCP client toolset for *tools*; an A2A bridge for *agents* |
 
@@ -84,7 +84,7 @@ rusty-adk = { version = "0.1", default-features = false, features = ["macros"] }
 | `macros` | the `#[adk_tool]` attribute | yes |
 | `mcp` | the MCP server and client transports | yes |
 | `models` | the Gemini and Anthropic connectors | yes |
-| `sqlite` | `SqliteStore` — durable session and artifact services | no |
+| `sqlite` | `SqliteStore` — durable session, artifact, and memory services | no |
 | `a2a` | Serve this agent over Agent2Agent, via `adk-a2a` | no |
 
 ## Concepts
@@ -124,7 +124,7 @@ A write becomes durable only once the `Runner` has processed the event carrying
 its delta. That ordering is the contract: code resuming after a yielded event
 can rely on its state having landed.
 
-### Sessions and artifacts
+### Sessions, artifacts, and memory
 
 The in-memory services are the default and keep everything in process memory —
 right for tests and one-shot scripts. Enable the `sqlite` feature for storage
@@ -132,25 +132,34 @@ that outlives the process:
 
 ```rust
 let store = SqliteStore::open("agent.db").await?;
-let services = store.services();  // sessions + artifacts, one database
+let services = store.services();  // all three services, one database
 ```
 
-Take them individually with `store.sessions()` and `store.artifacts()`, or open
-either on its own with `SqliteSessionService::open` /
-`SqliteArtifactService::open`.
+Take them individually with `store.sessions()`, `store.artifacts()`, and
+`store.memories()`, or open any on its own with the matching `::open`.
 
-Both reproduce the in-memory semantics exactly — the same prefix routing, the
-same hydration of `app:` and `user:` values onto each thread, the same refusal
-to record partial events, the same per-filename artifact versioning — so
-switching backends changes durability and nothing else. Threads, history, each
-state scope, and artifacts get their own table; `temp:` keys get none, which is
-what makes them temporary. Events and artifact payloads are stored as JSON
-rather than as columns, so schema additions like 2.0's `node_info` and `output`
-round-trip without a migration.
+Sessions and artifacts reproduce the in-memory semantics exactly — the same
+prefix routing, the same hydration of `app:` and `user:` values onto each
+thread, the same refusal to record partial events, the same per-filename
+versioning — so switching backends changes durability and nothing else. Threads,
+history, each state scope, and artifacts get their own table; `temp:` keys get
+none, which is what makes them temporary. Events and artifact payloads are
+stored as JSON rather than as columns, so schema additions like 2.0's
+`node_info` and `output` round-trip without a migration.
 
 That durability is what makes a suspended human-in-the-loop run resumable after
 a restart: the interrupt's resume point is ordinary session state, so it lands
 in the database with everything else.
+
+`SqliteMemoryService` is the deliberate exception. The in-memory one scores by
+counting how many query terms appear in an entry and says of itself that it is a
+placeholder to "swap in a real vector store" for — so rather than carry a
+stand-in into durable storage, this one indexes with SQLite's FTS5 and ranks by
+BM25. Isolation, the ingestion filter, and best-first ordering are identical;
+the *scores* are not comparable between the two, which is why the trait calls
+that field backend-specific. Re-ingesting a session replaces what it contributed
+before, so feeding a growing conversation in repeatedly converges rather than
+piling up duplicates.
 
 ### Graphs
 
