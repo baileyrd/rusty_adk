@@ -1,5 +1,7 @@
 # rusty-adk
 
+> **Archived — merged into [Rusty Mill](https://github.com/Rusty-Mill/rusty_mill).** This crate now lives at [`crates/rusty_adk`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/rusty_adk) in the Rusty Mill monorepo, which is where active development, issues, and pull requests happen now. This standalone repo is kept for historical reference only.
+
 A Rust implementation of the [Agent Development Kit (ADK) 2.0][adk] architecture.
 
 ADK 2.0 ships SDKs for Python, Go, TypeScript, Java, and Kotlin — but not Rust.
