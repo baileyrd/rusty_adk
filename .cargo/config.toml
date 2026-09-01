@@ -1,0 +1,10 @@
+# The workspace declares `rust-version = "1.85"` and CI tests against that
+# toolchain, so dependency resolution has to respect it too. Without this,
+# `cargo update` happily locks a dependency whose own `rust-version` is newer
+# than ours — the lockfile then builds on stable and fails on the MSRV leg with
+# "rustc 1.85.1 is not supported by the following packages".
+#
+# `fallback` keeps preferring the newest version, and only steps back to an
+# older one when the newest would push the required rustc past our MSRV.
+[resolver]
+incompatible-rust-versions = "fallback"
